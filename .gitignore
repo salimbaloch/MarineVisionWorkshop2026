@@ -1,0 +1,71 @@
+# Generated outputs
+Tide/m2_out/
+Tide/m3_out/
+Tide/fish_probe/
+Tide/urchin_lp/
+Tide/vis_duo/
+Tide/vis_ruod/
+Tide/vis_ruodr/
+Tide/vis_seaclear/
+
+m1_out/
+m4_out/
+crops_out/
+urchin_crops/
+urchin_previews/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# datasets
+Seaclear_Marine_Debris_Dataset/
+RUOD/
+DUO/
+
+# model weights
+*.pth
+*.pt
+*.zip
+
+# Tide generated assets
+Tide/pidinet_assets.zip
+
+# datasets inside DEIMv2
+DEIMv2/dataset/
+
+# generated outputs
+DEIMv2/diagnosis_out/
+DEIMv2/vis_results/
+
+# environment images
+Environment_pic/
+
+# annotations generated from datasets
+Environmet_ANN/
+
+# all image files (optional - if you don't want any images)
+*.jpg
+*.jpeg
+*.png
+
+# keep code/data configs if needed
+!*.py
+!*.json
+
+# Tide generated outputs
+Tide/vis_ruod/
+Tide/vis_duo/
+Tide/vis_seaclear/
+Tide/vis_ruodr/
+
+Tide/m1_out/
+Tide/m2_out/
+Tide/m3_out/
+Tide/m4_out/
+
+Tide/urchin_lp/
+Tide/fish_probe/
+
+# large assets
+Tide/pidinet_assets.zip
