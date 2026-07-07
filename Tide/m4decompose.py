@@ -343,6 +343,26 @@ def _conf_frag(g):        return _clamp(0.6*g["edge_confidence"] + 0.4*g["semant
 def _conf_boundary(b):    return _clamp(0.5*b["edge_confidence"] + 0.5*b["semantic_support"])
 
 
+
+def _poly_from_mask(mask, max_pts=40, eps=1.5):
+    """Largest-contour polyline of an atom mask, simplified and capped -- emitted
+    as a % poly comment so render_channels can stroke the true geometry.
+    Comments are invisible to clingo: zero grounding cost."""
+    if mask is None:
+        return None
+    m = (mask > 0).astype(np.uint8)
+    if m.sum() < 4:
+        return None
+    cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return None
+    c = max(cnts, key=cv2.contourArea if len(cnts) > 1 else len)
+    c = cv2.approxPolyDP(c, eps, closed=False).reshape(-1, 2)
+    if len(c) > max_pts:
+        c = c[np.linspace(0, len(c) - 1, max_pts).astype(int)]
+    return [(int(x), int(y)) for x, y in c]
+
+
 def write_facts(path, det_box_crop, crop_hw, region, foreigns, region_prims, geoms,
                 boundaries, relations, diag, oid="o1", cls="object"):
     bx = [int(round(v)) for v in det_box_crop]
@@ -451,6 +471,9 @@ def write_facts(path, det_box_crop, crop_hw, region, foreigns, region_prims, geo
               f"inside({b['id_b']},{oid})."]
         if b.get("length") is not None:
             L.append(f"length({b['id_b']},{int(round(b['length']))}).")
+        pts = _poly_from_mask(b.get("mask"))
+        if pts:
+            L.append("% poly " + b['id_b'] + ": " + " ".join(f"{x},{y}" for x, y in pts))
 
     # ---------- Relations ----------
     L += ["", "% Relations"]
@@ -535,7 +558,8 @@ def decompose_one(crop_rgb, dbx, tok, grid, mhw, prof, edger, args, device):
 
     # B_dino: needed for ridge-snap (bottle) and/or the ridge edge-gate (fish, bottle).
     # ellipse_body_atom no-ops snap if bdino_up is None.
-    need_ridge = prof.edge_gate == "mask_or_ridge"
+    gate = args.edge_gate if getattr(args, "edge_gate", "profile") != "profile" else prof.edge_gate
+    need_ridge = gate == "mask_or_ridge"
     bdino_up = None
     if prof.ridge_snap or need_ridge:
         bdino = core.feature_boundary_map(tok, grid, args.conn)
@@ -718,6 +742,8 @@ def main():
     ap.add_argument("--pidinet-weights", default="/srv/data1/Salim/Underwater/table7_pidinet.pth")
     ap.add_argument("--pidinet-device", default=None)
     ap.add_argument("--edge-thr", type=float, default=0.4)
+    ap.add_argument("--edge-gate", choices=["profile", "mask", "mask_or_ridge"], default="profile",
+                    help="override the profile's outer-gate (e.g. try ridge rescue on urchin)")
     # geometric primitives
     ap.add_argument("--obj-band-px", type=int, default=5)
     ap.add_argument("--min-len", type=int, default=10)
@@ -790,6 +816,7 @@ def main():
 
     gt_by_img = {} if args.no_gt else load_gt_boxes(args.gt_json)
     gt_boxes = {}                                    # {stem: [x1,y1,x2,y2] in crop coords}
+    crop_meta = {}                                   # {stem: [img_id, ox1, oy1, ix1,iy1,ix2,iy2, score]}
     if args.dump_emb:
         emb_dir = args.emb_dir or os.path.join(args.out_dir, "emb")
         os.makedirs(emb_dir, exist_ok=True)
@@ -819,6 +846,9 @@ def main():
                 continue
 
             # --- Stage-4/5 data dumps ---
+            crop_meta[stem] = [int(image_id), int(ox1), int(oy1),
+                               float(d["box"][0]), float(d["box"][1]),
+                               float(d["box"][2]), float(d["box"][3]), float(d["score"])]
             if not args.no_gt:
                 gtb = match_gt_crop(gt_by_img.get(image_id, []), target, d["box"],
                                     (ox1, oy1), (ch, cw), args.gt_iou)
@@ -856,6 +886,11 @@ def main():
         with open(gt_out, "w") as fh:
             _json.dump(gt_boxes, fh)
         print(f"  gt boxes matched     : {len(gt_boxes)}/{n_done}  -> {gt_out}")
+    import json as _json
+    cm_out = os.path.join(args.out_dir, "crop_meta.json")
+    with open(cm_out, "w") as fh:
+        _json.dump(crop_meta, fh)
+    print(f"  crop meta written    : {len(crop_meta)}  -> {cm_out}")
     if args.dump_emb:
         print(f"  embeddings dumped    : {n_done}  -> {emb_dir}/<stem>.npz")
     if n_done:

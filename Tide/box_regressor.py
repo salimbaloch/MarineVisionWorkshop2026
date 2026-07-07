@@ -1,4 +1,3 @@
-
 import os, re, glob, json, argparse
 import numpy as np
 import cv2
@@ -16,6 +15,7 @@ _CONF = re.compile(r"confidence\((\w+),(-?\d+)\)")
 _CROP = re.compile(r"crop_size\([^,]+,size\((\d+),(\d+)\)\)")
 _TYPE = re.compile(r"primitive_type\((\w+),(\w+)\)")
 _BSRC = re.compile(r"boundary_source\((\w+),(\w+)\)")
+_POLY = re.compile(r"%\s*poly\s+(\w+):\s*(.+)")
 
 
 def _crop_hw(facts, meta):
@@ -46,26 +46,39 @@ def render_channels(facts, selected, meta, S=64):
         m = cv2.resize(mask_u8, (S, S), interpolation=cv2.INTER_NEAREST) > 0
         ch[name][m] = np.maximum(ch[name][m], conf.get(cid, 0.5))
 
+    polys = {}
+    for m in _POLY.finditer(facts):
+        try:
+            polys[m.group(1)] = np.array(
+                [[int(a) for a in p.split(",")] for p in m.group(2).split()], np.int32)
+        except ValueError:
+            pass
+    tk = max(1, int(round(min(H, W) * 0.02)))            # stroke ~2% of crop size
+
     for pid in selected:
         canvas = np.zeros((H, W), np.uint8)
-        if pid in ell:                                   # ellipse primitive
+        if pid in ell:                                   # ellipse primitive -> OUTLINE
             cx, cy, d1, d2, ang = ell[pid]
             cv2.ellipse(canvas, (cx, cy), (max(1, d1 // 2), max(1, d2 // 2)),
-                        float(ang), 0, 360, 255, -1)
+                        float(ang), 0, 360, 255, tk)
             fill(canvas, "ellipse", pid); continue
-        if pid in rect:                                  # rect primitive
+        if pid in rect:                                  # rect primitive -> OUTLINE
             cx, cy, w, h, ang = rect[pid]
             box = cv2.boxPoints(((cx, cy), (w, h), float(ang))).astype(np.int32)
-            cv2.fillPoly(canvas, [box], 255)
+            cv2.polylines(canvas, [box], True, 255, tk)
             fill(canvas, "rect", pid); continue
-        if pid not in meta["boxes"]:
-            continue
-        x1, y1, x2, y2 = meta["boxes"][pid]
-        cv2.rectangle(canvas, (x1, y1), (x2, y2), 255, -1)
-        if pid == meta["body"]:
-            fill(canvas, "body_region", pid)
-        elif pid in meta["boundary_ids"]:
-            fill(canvas, "edge_fragment" if bsrc.get(pid) == "edge" else "boundary", pid)
+        if pid == meta["body"] and pid in meta["boxes"]:  # body keeps FILLED extent
+            x1, y1, x2, y2 = meta["boxes"][pid]
+            cv2.rectangle(canvas, (x1, y1), (x2, y2), 255, -1)
+            fill(canvas, "body_region", pid); continue
+        if pid in meta["boundary_ids"]:                  # boundary atoms: true geometry
+            name = "edge_fragment" if bsrc.get(pid) == "edge" else "boundary"
+            if pid in polys and len(polys[pid]) >= 2:    # stroke the % poly geometry
+                cv2.polylines(canvas, [polys[pid]], False, 255, tk)
+            elif pid in meta["boxes"]:                   # fallback: OUTLINE, never fill
+                x1, y1, x2, y2 = meta["boxes"][pid]
+                cv2.rectangle(canvas, (x1, y1), (x2, y2), 255, tk)
+            fill(canvas, name, pid)
     # scale coords already handled by resize; return C,H,W
     return np.stack([ch[c] for c in CHANNELS], 0)
 
@@ -97,8 +110,14 @@ class RefineSet(Dataset):
 
     def __getitem__(self, i):
         stem, facts, meta, gtb, emb_p = self.items[i]
-        atoms, _ = solve(self.rules + "\n" + facts + "\n" + self.wb)
-        selected = parse_explains(atoms)
+        if not hasattr(self, "_cache"):
+            self._cache = {}
+        if stem in self._cache:                       # solve once per stem, not per epoch
+            selected = self._cache[stem]
+        else:
+            atoms, _ = solve(self.rules + "\n" + facts + "\n" + self.wb)
+            selected = parse_explains(atoms)
+            self._cache[stem] = selected
         prim = render_channels(facts, selected, meta, self.S)                 # (K,S,S)
         emb = np.load(emb_p)["emb"].astype(np.float32)                        # (Ce,gh,gw)
         emb = cv2.resize(emb.transpose(1, 2, 0), (self.S, self.S),
@@ -106,6 +125,52 @@ class RefineSet(Dataset):
         return (torch.from_numpy(emb), torch.from_numpy(prim),
                 torch.tensor(meta["proposal"], dtype=torch.float32),
                 torch.tensor(gtb, dtype=torch.float32))
+
+
+# ------------------------------------------------------------------ jitter (train-time augmentation)
+def jitter_box(prop, hw, shift=0.15, scale=0.25, rng=None):
+    """Randomly perturb an xyxy proposal: center shift up to +-shift*w/h, log-uniform
+    scale in [1-scale, 1+scale] per axis. GT stays fixed -> manufactures new
+    (loose proposal -> GT) training pairs. Includes near-zero jitter, which teaches
+    'predict ~zero offset when the box is already right'."""
+    rng = rng or np.random
+    x1, y1, x2, y2 = [float(v) for v in prop]
+    w, h = max(x2 - x1, 1.0), max(y2 - y1, 1.0)
+    cx = (x1 + x2) / 2 + rng.uniform(-shift, shift) * w
+    cy = (y1 + y2) / 2 + rng.uniform(-shift, shift) * h
+    nw = w * float(np.exp(rng.uniform(np.log(1 - scale), np.log(1 + scale))))
+    nh = h * float(np.exp(rng.uniform(np.log(1 - scale), np.log(1 + scale))))
+    H, W = hw
+    jx1 = np.clip(cx - nw / 2, 0, W - 2); jy1 = np.clip(cy - nh / 2, 0, H - 2)
+    jx2 = np.clip(cx + nw / 2, jx1 + 1, W - 1); jy2 = np.clip(cy + nh / 2, jy1 + 1, H - 1)
+    return (float(jx1), float(jy1), float(jx2), float(jy2))
+
+
+class JitterView(Dataset):
+    """Training view of a RefineSet subset: each __getitem__ draws a fresh jittered
+    proposal (embedding, atom maps, and GT are untouched -- neither the ASP selection
+    nor the rendered channels depend on the proposal box). repeat>1 lengthens an
+    epoch so tiny datasets see more jitter draws per epoch."""
+    def __init__(self, base, indices, shift=0.15, scale=0.25, repeat=4):
+        self.base, self.indices = base, list(indices)
+        self.shift, self.scale, self.repeat = shift, scale, repeat
+
+    def __len__(self):
+        return len(self.indices) * self.repeat
+
+    def __getitem__(self, i):
+        j = self.indices[i % len(self.indices)]
+        emb, prim, prop, gt = self.base[j]
+        facts = self.base.items[j][1]; meta = self.base.items[j][2]
+        hw = _crop_hw(facts, meta)
+        jp = jitter_box(prop.numpy(), hw, self.shift, self.scale)
+        return emb, prim, torch.tensor(jp, dtype=torch.float32), gt
+
+
+def blend(prop, refined, alpha):
+    """alpha-gate: interpolate proposal -> refined box. alpha=0 returns the
+    proposal untouched (do-no-harm floor); alpha=1 is full refinement."""
+    return prop + alpha * (refined - prop)
 
 
 # ------------------------------------------------------------------ model
@@ -183,28 +248,41 @@ def _iou_np(a, b):
 
 
 @torch.no_grad()
-def evaluate(net, loader, dev):
-    """Per-detection: baseline IoU(det,gt) vs refined IoU(ref,gt), area ratio, %improved."""
+def evaluate(net, loader, dev, alpha=1.0, strat_thr=0.75):
+    """Per-detection: baseline IoU(det,gt) vs refined IoU(ref,gt) with alpha-gated
+    blending, area ratio, %improved -- plus stratified stats for loose
+    (baseline IoU < strat_thr) vs tight (>= strat_thr) proposals."""
     net.eval()
     ds = rs = ar = 0.0; imp = n = 0
+    strat = {"loose": [0.0, 0.0, 0], "tight": [0.0, 0.0, 0]}   # [det_sum, ref_sum, n]
     for emb, prim, prop, gt in loader:
         emb, prim = emb.to(dev), prim.to(dev)
-        ref = decode(prop.to(dev), net(emb, prim)).cpu().numpy()
+        prop_d = prop.to(dev)
+        ref = blend(prop_d, decode(prop_d, net(emb, prim)), alpha).cpu().numpy()
         prop_np, gt_np = prop.numpy(), gt.numpy()
         for k in range(len(gt_np)):
             di = _iou_np(prop_np[k], gt_np[k]); ri = _iou_np(ref[k], gt_np[k])
             ds += di; rs += ri; imp += int(ri > di + 1e-6); n += 1
+            b = strat["loose" if di < strat_thr else "tight"]
+            b[0] += di; b[1] += ri; b[2] += 1
             ad = max(0.0, prop_np[k][2]-prop_np[k][0]) * max(0.0, prop_np[k][3]-prop_np[k][1])
             arr = max(0.0, ref[k][2]-ref[k][0]) * max(0.0, ref[k][3]-ref[k][1])
             ar += (arr / ad) if ad > 0 else 1.0
-    return dict(n=n, det=ds/n, ref=rs/n, improved=imp, area_ratio=ar/n)
+    return dict(n=n, det=ds/n, ref=rs/n, improved=imp, area_ratio=ar/n,
+                alpha=alpha, strat_thr=strat_thr, strat=strat)
 
 
 def report(tag, m):
     print(f"  [{tag:>5}] n={m['n']:<5}  IoU  det {m['det']:.3f} -> ref {m['ref']:.3f}  "
           f"(delta {m['ref']-m['det']:+.3f})   improved {m['improved']}/{m['n']} "
           f"({100*m['improved']/m['n']:.0f}%)   mean area ref/det {m['area_ratio']:.2f} "
-          f"({'shrink' if m['area_ratio']<1 else 'grow'} {abs(1-m['area_ratio'])*100:.0f}%)")
+          f"({'shrink' if m['area_ratio']<1 else 'grow'} {abs(1-m['area_ratio'])*100:.0f}%)"
+          f"   [alpha={m.get('alpha', 1.0):.2f}]")
+    for name, lbl in (("loose", f"IoU<{m['strat_thr']:.2f}"), ("tight", f"IoU>={m['strat_thr']:.2f}")):
+        d, r, k = m["strat"][name]
+        if k:
+            print(f"          {name:5s} ({lbl}, n={k}):  det {d/k:.3f} -> ref {r/k:.3f}  "
+                  f"(delta {r/k - d/k:+.3f})")
 
 
 # ------------------------------------------------------------------ train
@@ -227,18 +305,34 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--out", default=None)
+    ap.add_argument("--jitter-shift", type=float, default=0.15,
+                    help="max center shift as fraction of box w/h (0 disables jitter)")
+    ap.add_argument("--jitter-scale", type=float, default=0.25,
+                    help="max log-uniform scale factor per axis")
+    ap.add_argument("--jitter-repeat", type=int, default=4,
+                    help="jittered draws per sample per epoch")
+    ap.add_argument("--weight-decay", type=float, default=1e-2)
+    ap.add_argument("--alphas", default="0,0.25,0.5,0.75,1.0",
+                    help="alpha-gate candidates swept on the internal held-out slice")
     args = ap.parse_args()
 
     from torch.utils.data import Subset
     ds = RefineSet(args.lp_dir, args.emb_dir, args.gt, args.rules, args.weights, args.cls, args.S)
     tr_idx, te_idx = split_indices(ds.items, args.val_frac, args.split_by, args.seed)
-    tr_dl = DataLoader(Subset(ds, tr_idx), batch_size=args.batch, shuffle=True, num_workers=args.workers)
+    np.random.seed(args.seed)
+    if args.jitter_shift > 0:
+        tr_train = JitterView(ds, tr_idx, args.jitter_shift, args.jitter_scale, args.jitter_repeat)
+    else:
+        tr_train = Subset(ds, tr_idx)
+    tr_dl = DataLoader(tr_train, batch_size=args.batch, shuffle=True, num_workers=args.workers)
+    tr_eval_dl = DataLoader(Subset(ds, tr_idx), batch_size=args.batch, shuffle=False,
+                            num_workers=args.workers)   # UNjittered train view for reporting
     te_dl = DataLoader(Subset(ds, te_idx), batch_size=args.batch, shuffle=False, num_workers=args.workers)
 
     emb_dim = ds[0][0].shape[0]
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     net = BoxRegressor(emb_dim).to(dev)
-    opt = torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=1e-4)
+    opt = torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     print(f"[{args.cls}] {len(ds)} samples -> train {len(tr_idx)} / test {len(te_idx)} "
           f"(split_by={args.split_by}, seed={args.seed})  emb_dim={emb_dim}  device={dev}")
 
@@ -254,14 +348,25 @@ def main():
             print(f"epoch {ep+1:3d}  train loss {tot/n:.4f}  train IoU {iou_sum/n:.4f}")
 
     
+    # ---- alpha-gate: sweep on the internal held-out slice, pick by mean refined IoU.
+    # Ties resolve toward SMALLER alpha (closer to do-no-harm). alpha=0 in the sweep
+    # guarantees the floor is 'proposal unchanged'.
+    cand = [float(a) for a in args.alphas.split(",")]
+    sweep = [(evaluate(net, te_dl, dev, alpha=a)["ref"], -a) for a in cand]
+    best_alpha = -max(sweep)[1]
+    print(f"\n  alpha sweep on held-out slice: "
+          + "  ".join(f"a={a:.2f}:IoU {r:.3f}" for (r, na), a in zip(sweep, cand))
+          + f"   -> chosen alpha={best_alpha:.2f}")
+
     print(f"\n=== {args.cls}: localization vs DEIMv2 proposals ===")
-    report("train", evaluate(net, tr_dl, dev))
-    report("TEST",  evaluate(net, te_dl, dev))
+    report("train", evaluate(net, tr_eval_dl, dev, alpha=best_alpha))
+    report("TEST",  evaluate(net, te_dl, dev, alpha=best_alpha))
     print("  (TEST is held out; the train row is only to gauge the generalization gap.)")
 
     out = args.out or f"box_regressor_{args.cls}.pt"
-    torch.save(net.state_dict(), out)
-    print(f"saved {out}")
+    torch.save({"model": net.state_dict(), "alpha": best_alpha,
+                "emb_dim": emb_dim, "cls": args.cls}, out)
+    print(f"saved {out}  (checkpoint carries alpha={best_alpha:.2f}; eval_coco_ap applies it)")
 
 
 if __name__ == "__main__":
